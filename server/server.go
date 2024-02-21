@@ -358,6 +358,9 @@ type Server struct {
 
 	// Queue to process JS API requests that come from routes (or gateways)
 	jsAPIRoutedReqs *ipQueue[*jsAPIRoutedReq]
+
+	// Whether account NRG is supported cluster-wide or not.
+	accountNRG atomic.Bool
 }
 
 // For tracking JS nodes.
@@ -373,6 +376,7 @@ type nodeInfo struct {
 	offline         bool
 	js              bool
 	binarySnapshots bool
+	accountNRG      bool
 }
 
 // Make sure all are 64bits for atomic use
@@ -762,7 +766,7 @@ func NewServer(opts *Options) (*Server, error) {
 			opts.Tags,
 			&JetStreamConfig{MaxMemory: opts.JetStreamMaxMemory, MaxStore: opts.JetStreamMaxStore, CompressOK: true},
 			nil,
-			false, true, true,
+			false, true, true, true,
 		})
 	}
 
@@ -1740,7 +1744,7 @@ func (s *Server) setSystemAccount(acc *Account) error {
 		sendq:   newIPQueue[*pubMsg](s, "System sendQ"),
 		recvq:   newIPQueue[*inSysMsg](s, "System recvQ"),
 		resetCh: make(chan struct{}),
-		sq:      s.newSendQ(),
+		sq:      s.newSendQ(acc),
 		statsz:  eventsHBInterval,
 		orphMax: 5 * eventsHBInterval,
 		chkOrph: 3 * eventsHBInterval,
