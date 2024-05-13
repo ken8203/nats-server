@@ -23640,13 +23640,13 @@ func TestJetStreamStreamCreatePedanticMode(t *testing.T) {
 
 	tests := []struct {
 		name      string
-		cfg       StreamRequest
+		cfg       StreamConfigRequest
 		shouldErr bool
 		update    bool
 	}{
 		{
 			name: "too_high_duplicate",
-			cfg: StreamRequest{
+			cfg: StreamConfigRequest{
 				StreamConfig: StreamConfig{
 					Name:       "TEST",
 					MaxAge:     time.Minute,
@@ -23659,7 +23659,7 @@ func TestJetStreamStreamCreatePedanticMode(t *testing.T) {
 		},
 		{
 			name: "duplicate_over_limits",
-			cfg: StreamRequest{
+			cfg: StreamConfigRequest{
 				StreamConfig: StreamConfig{
 					Name:       "TEST",
 					MaxAge:     time.Hour * 60,
@@ -23672,7 +23672,7 @@ func TestJetStreamStreamCreatePedanticMode(t *testing.T) {
 		},
 		{
 			name: "duplicate_window_within_limits",
-			cfg: StreamRequest{
+			cfg: StreamConfigRequest{
 				StreamConfig: StreamConfig{
 					Name:       "TEST",
 					MaxAge:     time.Hour * 60,
@@ -23685,7 +23685,7 @@ func TestJetStreamStreamCreatePedanticMode(t *testing.T) {
 		},
 		{
 			name: "update_too_high_duplicate",
-			cfg: StreamRequest{
+			cfg: StreamConfigRequest{
 				StreamConfig: StreamConfig{
 					Name:       "TEST",
 					MaxAge:     time.Minute,

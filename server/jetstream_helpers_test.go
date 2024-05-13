@@ -1613,7 +1613,7 @@ func (c *cluster) stableTotalSubs() (total int) {
 
 }
 
-func addStreamPedanticWithError(t *testing.T, nc *nats.Conn, cfg *StreamRequest) (*StreamInfo, *ApiError) {
+func addStreamPedanticWithError(t *testing.T, nc *nats.Conn, cfg *StreamConfigRequest) (*StreamInfo, *ApiError) {
 	t.Helper()
 	req, err := json.Marshal(cfg)
 	require_NoError(t, err)
@@ -1628,7 +1628,7 @@ func addStreamPedanticWithError(t *testing.T, nc *nats.Conn, cfg *StreamRequest)
 	return resp.StreamInfo, resp.Error
 }
 
-func updateStreamPedanticWithError(t *testing.T, nc *nats.Conn, cfg *StreamRequest) (*StreamInfo, *ApiError) {
+func updateStreamPedanticWithError(t *testing.T, nc *nats.Conn, cfg *StreamConfigRequest) (*StreamInfo, *ApiError) {
 	t.Helper()
 	req, err := json.Marshal(cfg)
 	require_NoError(t, err)
