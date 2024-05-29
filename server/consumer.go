@@ -41,6 +41,7 @@ const (
 
 // Headers sent when batch size was completed, but there were remaining bytes.
 const JsPullRequestRemainingBytesT = "NATS/1.0 409 Batch Completed\r\n%s: %d\r\n%s: %d\r\n\r\n"
+const JSPullRequestPinIdT = "Nats-Pinned-Id: %s\r\n"
 
 type ConsumerInfo struct {
 	Stream         string          `json:"stream_name"`
@@ -109,6 +110,11 @@ type ConsumerConfig struct {
 
 	// PauseUntil is for suspending the consumer until the deadline.
 	PauseUntil *time.Time `json:"pause_until,omitempty"`
+
+	// Priority groups
+	PriorityGroups  []string       `json:"priority_groups,omitempty"`
+	PriorityPolicy  PriorityPolicy `json:"priority_policy,omitempty"`
+	PriorityTimeout time.Duration  `json:"priority_timeout,omitempty"`
 }
 
 // SequenceInfo has both the consumer and the stream sequence and last activity.
@@ -186,6 +192,29 @@ func (a *ConsumerAction) UnmarshalJSON(data []byte) error {
 // ConsumerNakOptions is for optional NAK values, e.g. delay.
 type ConsumerNakOptions struct {
 	Delay time.Duration `json:"delay"`
+}
+
+// PriorityPolicy determines policy for selecting messages based on priority.
+type PriorityPolicy int
+
+const (
+	// No priority policy.
+	PriorityNone PriorityPolicy = iota
+	// Clients will get the messages only if certain criteria are specified.
+	PriorityOverflow
+	// Single client takes over handling of the messages, while others are on standby.
+	PriorityPinnedClient
+)
+
+func (pp PriorityPolicy) String() string {
+	switch pp {
+	case PriorityOverflow:
+		return "overflow"
+	case PriorityPinnedClient:
+		return "pinned_client"
+	default:
+		return "none"
+	}
 }
 
 // DeliverPolicy determines how the consumer should select the first message to deliver.
@@ -398,6 +427,10 @@ type consumer struct {
 
 	// for stream signaling when multiple filters are set.
 	sigSubs []*subscription
+
+	// Priority groups
+	currentNuid string
+	pinnedTtl   *time.Timer
 }
 
 // A single subject filter.
@@ -3046,53 +3079,63 @@ func (o *consumer) needAck(sseq uint64, subj string) bool {
 	return needAck
 }
 
+type PriorityGroups struct {
+	Group         string `json:"group,omitempty"`
+	MinPending    int    `json:"min_pending,omitempty"`
+	MinAckPending int    `json:"min_ack_pending,omitempty"`
+	Id            string `json:"id,omitempty"`
+}
+
 // Helper for the next message requests.
-func nextReqFromMsg(msg []byte) (time.Time, int, int, bool, time.Duration, time.Time, error) {
+func nextReqFromMsg(msg []byte) (time.Time, int, int, bool, time.Duration, time.Time, *PriorityGroups, error) {
 	req := bytes.TrimSpace(msg)
 
 	switch {
 	case len(req) == 0:
-		return time.Time{}, 1, 0, false, 0, time.Time{}, nil
+		return time.Time{}, 1, 0, false, 0, time.Time{}, nil, nil
 
 	case req[0] == '{':
 		var cr JSApiConsumerGetNextRequest
 		if err := json.Unmarshal(req, &cr); err != nil {
-			return time.Time{}, -1, 0, false, 0, time.Time{}, err
+			return time.Time{}, -1, 0, false, 0, time.Time{}, nil, err
 		}
 		var hbt time.Time
 		if cr.Heartbeat > 0 {
 			if cr.Heartbeat*2 > cr.Expires {
-				return time.Time{}, 1, 0, false, 0, time.Time{}, errors.New("heartbeat value too large")
+				return time.Time{}, 1, 0, false, 0, time.Time{}, nil, errors.New("heartbeat value too large")
 			}
 			hbt = time.Now().Add(cr.Heartbeat)
 		}
 		if cr.Expires == time.Duration(0) {
-			return time.Time{}, cr.Batch, cr.MaxBytes, cr.NoWait, cr.Heartbeat, hbt, nil
+			return time.Time{}, cr.Batch, cr.MaxBytes, cr.NoWait, cr.Heartbeat, hbt, &cr.PriorityGroups, nil
 		}
-		return time.Now().Add(cr.Expires), cr.Batch, cr.MaxBytes, cr.NoWait, cr.Heartbeat, hbt, nil
+		return time.Now().Add(cr.Expires), cr.Batch, cr.MaxBytes, cr.NoWait, cr.Heartbeat, hbt, &cr.PriorityGroups, nil
 	default:
 		if n, err := strconv.Atoi(string(req)); err == nil {
-			return time.Time{}, n, 0, false, 0, time.Time{}, nil
+			return time.Time{}, n, 0, false, 0, time.Time{}, nil, nil
 		}
 	}
 
-	return time.Time{}, 1, 0, false, 0, time.Time{}, nil
+	return time.Time{}, 1, 0, false, 0, time.Time{}, nil, nil
 }
 
 // Represents a request that is on the internal waiting queue
 type waitingRequest struct {
-	next     *waitingRequest
-	acc      *Account
-	interest string
-	reply    string
-	n        int // For batching
-	d        int // num delivered
-	b        int // For max bytes tracking
-	expires  time.Time
-	received time.Time
-	hb       time.Duration
-	hbt      time.Time
-	noWait   bool
+	next           *waitingRequest
+	acc            *Account
+	interest       string
+	reply          string
+	n              int // For batching
+	d              int // num delivered
+	b              int // For max bytes tracking
+	expires        time.Time
+	received       time.Time
+	hb             time.Duration
+	hbt            time.Time
+	noWait         bool
+	priorityGroups *PriorityGroups
+	rtt            time.Duration
+	currentPinned  bool
 }
 
 // sync.Pool for waiting requests.
@@ -3125,6 +3168,8 @@ type waitQueue struct {
 	last   time.Time
 	head   *waitingRequest
 	tail   *waitingRequest
+	// TODO(jrm): do we want a new data structure here for pinned pull requests?
+	// like pinned map[string]*waitingRequest where key is group?
 }
 
 // Create a new ring buffer with at most max items.
@@ -3255,6 +3300,8 @@ func (o *consumer) pendingRequests() map[string]*waitingRequest {
 // That will be handled by processWaiting.
 // Lock should be held.
 func (o *consumer) nextWaiting(sz int) *waitingRequest {
+	//TODO(jrm): check pinned, check overflows.
+	// Do we need to check again for pinned TTL?
 	if o.waiting == nil || o.waiting.isEmpty() {
 		return nil
 	}
@@ -3288,6 +3335,20 @@ func (o *consumer) nextWaiting(sz int) *waitingRequest {
 
 		if wr.expires.IsZero() || time.Now().Before(wr.expires) {
 			rr := wr.acc.sl.Match(wr.interest)
+			// TODO(jrm): are we sure we are handling the pinned TTL correctly?
+			// TODO(jrm): we could optimize the `wr` for pinned by having a separate
+			// pointer for the pinned puller, but at the same time, we have to
+			// TODO(jrm): we are ignoring groups for now.
+			if o.currentNuid != "" {
+				// Check if we have a match on the currentNuid
+				if wr.priorityGroups.Id == o.currentNuid {
+					return o.waiting.pop()
+				} else {
+					// FIXME(jrm): we're skipping interest expiration here.
+					wr = wr.next
+					continue
+				}
+			}
 			if len(rr.psubs)+len(rr.qsubs) > 0 {
 				return o.waiting.pop()
 			} else if time.Since(wr.received) < defaultGatewayRecentSubExpiration && (o.srv.leafNodeEnabled || o.srv.gateway.enabled) {
@@ -3318,6 +3379,21 @@ func (o *consumer) nextWaiting(sz int) *waitingRequest {
 			o.removeClusterPendingRequest(wr.reply)
 		}
 		wr.recycle()
+	}
+	// we did not find any valid request.
+	// Let's pick new lowest rtt pull request.
+	// TODO(jrm): Maybe this should be done in `processWaiting`.
+	if o.currentNuid != _EMPTY_ && o.cfg.PriorityPolicy == PriorityPinnedClient {
+		var lowestRtt *waitingRequest
+		for wr := o.waiting.peek(); wr != nil; wr = o.waiting.peek() {
+			if lowestRtt == nil || wr.rtt < lowestRtt.rtt {
+				lowestRtt = wr
+			}
+		}
+		// Deliver the message to the new pinned
+		if lowestRtt != nil {
+			return o.waiting.pop()
+		}
 	}
 	return nil
 }
@@ -3392,11 +3468,12 @@ func (o *consumer) processNextMsgRequest(reply string, msg []byte) {
 	}
 
 	// Check payload here to see if they sent in batch size or a formal request.
-	expires, batchSize, maxBytes, noWait, hb, hbt, err := nextReqFromMsg(msg)
+	expires, batchSize, maxBytes, noWait, hb, hbt, priorityGroups, err := nextReqFromMsg(msg)
 	if err != nil {
 		sendErr(400, fmt.Sprintf("Bad Request - %v", err))
 		return
 	}
+	requestorRtt := o.acc.ic.rtt
 
 	// Check for request limits
 	if o.cfg.MaxRequestBatch > 0 && batchSize > o.cfg.MaxRequestBatch {
@@ -3412,6 +3489,25 @@ func (o *consumer) processNextMsgRequest(reply string, msg []byte) {
 	if maxBytes > 0 && o.cfg.MaxRequestMaxBytes > 0 && maxBytes > o.cfg.MaxRequestMaxBytes {
 		sendErr(409, fmt.Sprintf("Exceeded MaxRequestMaxBytes of %v", o.cfg.MaxRequestMaxBytes))
 		return
+	}
+
+	if priorityGroups != nil {
+		if priorityGroups.Id != o.currentNuid {
+			// TODO(jrm): pick a nice error code (423 is "locked")
+			sendErr(423, fmt.Sprintf("Pinned id mismatch"))
+			return
+		} else {
+			if o.pinnedTtl != nil {
+				o.pinnedTtl.Reset(o.cfg.PriorityTimeout)
+			} else {
+				o.pinnedTtl = time.AfterFunc(o.cfg.PriorityTimeout, func() {
+					o.mu.Lock()
+					o.currentNuid = _EMPTY_
+					// TODO(jrm): we need to assign new nuid in processWaiting or nextWaiting
+					o.mu.Unlock()
+				})
+			}
+		}
 	}
 
 	// If we have the max number of requests already pending try to expire.
@@ -3450,8 +3546,9 @@ func (o *consumer) processNextMsgRequest(reply string, msg []byte) {
 
 	// Create a waiting request.
 	wr := wrPool.Get().(*waitingRequest)
-	wr.acc, wr.interest, wr.reply, wr.n, wr.d, wr.noWait, wr.expires, wr.hb, wr.hbt = acc, interest, reply, batchSize, 0, noWait, expires, hb, hbt
+	wr.acc, wr.interest, wr.reply, wr.n, wr.d, wr.noWait, wr.expires, wr.hb, wr.hbt, wr.priorityGroups = acc, interest, reply, batchSize, 0, noWait, expires, hb, hbt, priorityGroups
 	wr.b = maxBytes
+	wr.rtt = requestorRtt
 	wr.received = time.Now()
 
 	if err := o.waiting.add(wr); err != nil {
@@ -3682,6 +3779,7 @@ func (o *consumer) getNextMsg() (*jsPubMsg, uint64, error) {
 
 // Will check for expiration and lack of interest on waiting requests.
 // Will also do any heartbeats and return the next expiration or HB interval.
+// TODO(jrm): should we handle priority groups cleanup/pinned TTL etc here?
 func (o *consumer) processWaiting(eos bool) (int, int, int, time.Time) {
 	var fexp time.Time
 	if o.srv == nil || o.waiting.isEmpty() {
