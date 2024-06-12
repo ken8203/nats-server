@@ -2138,18 +2138,19 @@ func (c *client) processGatewayRSub(arg []byte) error {
 // for queue subscriptions.
 // <Outbound connection: invoked when client message is published,
 // so from any client connection's readLoop>
-func (c *client) gatewayInterest(acc, subj string) (bool, *SublistResult) {
+func (c *client) gatewayInterest(acc, subj string) (bool, *SublistResult, func()) {
 	ei, accountInMap := c.gw.outsim.Load(acc)
 	// If there is an entry for this account and ei is nil,
 	// it means that the remote is not interested at all in
 	// this account and we could not possibly have queue subs.
 	if accountInMap && ei == nil {
-		return false, nil
+		return false, nil, func() {}
 	}
 	// Assume interest if account not in map, unless we support
 	// only interest-only mode.
 	psi := !accountInMap && !c.gw.interestOnlyMode
 	var r *SublistResult
+	var rc func()
 	if accountInMap {
 		// If in map, check for subs interest with sublist.
 		e := ei.(*outsie)
@@ -2166,7 +2167,7 @@ func (c *client) gatewayInterest(acc, subj string) (bool, *SublistResult) {
 		// If we are in modeInterestOnly (e.ni will be nil)
 		// or if we have queue subs, we also need to check sl.Match.
 		if e.ni == nil || e.qsubs > 0 {
-			r = e.sl.Match(subj)
+			r, rc = e.sl.Match(subj)
 			if len(r.psubs) > 0 {
 				psi = true
 			}
@@ -2179,7 +2180,7 @@ func (c *client) gatewayInterest(acc, subj string) (bool, *SublistResult) {
 			r = nil
 		}
 	}
-	return psi, r
+	return psi, r, rc
 }
 
 // switchAccountToInterestMode will switch an account over to interestMode.
@@ -2489,7 +2490,7 @@ func (g *srvGateway) shouldMapReplyForGatewaySend(acc *Account, reply []byte) bo
 	}
 	sl := sli.(*Sublist)
 	if sl.Count() > 0 {
-		if r := sl.Match(string(reply)); len(r.psubs)+len(r.qsubs) > 0 {
+		if sl.HasInterest(string(reply)) {
 			return true
 		}
 	}
@@ -2583,7 +2584,7 @@ func (c *client) sendMsgToGateways(acc *Account, msg, subject, reply []byte, qgr
 			}
 		} else {
 			// Plain sub interest and queue sub results for this account/subject
-			psi, qr := gwc.gatewayInterest(accName, string(subject))
+			psi, qr, rc := gwc.gatewayInterest(accName, string(subject))
 			if !psi && qr == nil {
 				continue
 			}
@@ -2608,6 +2609,7 @@ func (c *client) sendMsgToGateways(acc *Account, msg, subject, reply []byte, qgr
 					}
 				}
 			}
+			rc()
 			if !psi && len(queues) == 0 {
 				continue
 			}

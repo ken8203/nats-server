@@ -883,8 +883,9 @@ func (a *Account) Interest(subject string) int {
 	var nms int
 	a.mu.RLock()
 	if a.sl != nil {
-		res := a.sl.Match(subject)
+		res, rc := a.sl.Match(subject)
 		nms = len(res.psubs) + len(res.qsubs)
+		rc()
 	}
 	a.mu.RUnlock()
 	return nms
@@ -1843,10 +1844,13 @@ func (a *Account) _checkForReverseEntry(reply string, si *serviceImport, checkIn
 	// Note that if we are here reply has to be a literal subject.
 	if checkInterest {
 		// If interest still exists we can not clean these up yet.
-		if rr := a.sl.Match(reply); len(rr.psubs)+len(rr.qsubs) > 0 {
+		rr, rc := a.sl.Match(reply)
+		if len(rr.psubs)+len(rr.qsubs) > 0 {
 			a.mu.RUnlock()
+			rc()
 			return
 		}
+		rc()
 	}
 	a.mu.RUnlock()
 

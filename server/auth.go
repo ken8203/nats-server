@@ -977,14 +977,18 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) (au
 			deniedSub := []string{}
 			for _, sub := range denyAllJs {
 				if c.perms.pub.deny != nil {
-					if r := c.perms.pub.deny.Match(sub); len(r.psubs)+len(r.qsubs) > 0 {
+					r, rc := c.perms.pub.deny.Match(sub)
+					if len(r.psubs)+len(r.qsubs) > 0 {
 						deniedPub = append(deniedPub, sub)
 					}
+					rc()
 				}
 				if c.perms.sub.deny != nil {
-					if r := c.perms.sub.deny.Match(sub); len(r.psubs)+len(r.qsubs) > 0 {
+					r, rc := c.perms.sub.deny.Match(sub)
+					if len(r.psubs)+len(r.qsubs) > 0 {
 						deniedSub = append(deniedSub, sub)
 					}
+					rc()
 				}
 			}
 			if len(deniedPub) > 0 || len(deniedSub) > 0 {

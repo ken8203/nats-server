@@ -1018,11 +1018,12 @@ func (mset *stream) addConsumerWithAssignment(config *ConsumerConfig, oname stri
 		// Check if we are running only 1 replica and that the delivery subject has interest.
 		// Check in place here for interest. Will setup properly in setLeader.
 		if config.replicas(&mset.cfg) == 1 {
-			r := o.acc.sl.Match(o.cfg.DeliverSubject)
+			r, rc := o.acc.sl.Match(o.cfg.DeliverSubject)
 			if !o.hasDeliveryInterest(len(r.psubs)+len(r.qsubs) > 0) {
 				// Let the interest come to us eventually, but setup delete timer.
 				o.updateDeliveryInterest(false)
 			}
+			rc()
 		}
 	}
 
@@ -1153,7 +1154,9 @@ func (o *consumer) checkQueueInterest() {
 		subj = o.cfg.DeliverSubject
 	}
 
-	if rr := o.acc.sl.Match(subj); len(rr.qsubs) > 0 {
+	rr, rc := o.acc.sl.Match(subj)
+	defer rc()
+	if len(rr.qsubs) > 0 {
 		// Just grab first
 		if qsubs := rr.qsubs[0]; len(qsubs) > 0 {
 			if sub := rr.qsubs[0][0]; len(sub.queue) > 0 {
@@ -1572,8 +1575,9 @@ func (s *Server) hasGatewayInterest(account, subject string) bool {
 	gw.RLock()
 	defer gw.RUnlock()
 	for _, gwc := range gw.outo {
-		psi, qr := gwc.gatewayInterest(account, subject)
+		psi, qr, qrc := gwc.gatewayInterest(account, subject)
 		if psi || qr != nil {
+			qrc()
 			return true
 		}
 	}
@@ -1866,7 +1870,8 @@ func (acc *Account) checkNewConsumerConfig(cfg, ncfg *ConsumerConfig) error {
 		if ncfg.DeliverSubject == _EMPTY_ {
 			return errors.New("can not update push consumer to pull based")
 		}
-		rr := acc.sl.Match(cfg.DeliverSubject)
+		rr, rc := acc.sl.Match(cfg.DeliverSubject)
+		defer rc()
 		if len(rr.psubs)+len(rr.qsubs) != 0 {
 			return NewJSConsumerNameExistError()
 		}
@@ -3286,10 +3291,10 @@ func (o *consumer) nextWaiting(sz int) *waitingRequest {
 		}
 
 		if wr.expires.IsZero() || time.Now().Before(wr.expires) {
-			rr := wr.acc.sl.Match(wr.interest)
-			if len(rr.psubs)+len(rr.qsubs) > 0 {
+			if wr.acc.sl.HasInterest(wr.interest) {
 				return o.waiting.pop()
-			} else if time.Since(wr.received) < defaultGatewayRecentSubExpiration && (o.srv.leafNodeEnabled || o.srv.gateway.enabled) {
+			}
+			if time.Since(wr.received) < defaultGatewayRecentSubExpiration && (o.srv.leafNodeEnabled || o.srv.gateway.enabled) {
 				return o.waiting.pop()
 			} else if o.srv.gateway.enabled && o.srv.hasGatewayInterest(wr.acc.Name, wr.interest) {
 				return o.waiting.pop()
@@ -3714,8 +3719,7 @@ func (o *consumer) processWaiting(eos bool) (int, int, int, time.Time) {
 			continue
 		}
 		// Now check interest.
-		rr := wr.acc.sl.Match(wr.interest)
-		interest := len(rr.psubs)+len(rr.qsubs) > 0
+		interest := wr.acc.sl.HasInterest(wr.interest)
 		if !interest && (s.leafNodeEnabled || s.gateway.enabled) {
 			// If we are here check on gateways and leaf nodes (as they can mask gateways on the other end).
 			// If we have interest or the request is too young break and do not expire.
@@ -5027,9 +5031,9 @@ func (o *consumer) isActive() bool {
 // hasNoLocalInterest return true if we have no local interest.
 func (o *consumer) hasNoLocalInterest() bool {
 	o.mu.RLock()
-	rr := o.acc.sl.Match(o.cfg.DeliverSubject)
+	interest := o.acc.sl.HasInterest(o.cfg.DeliverSubject)
 	o.mu.RUnlock()
-	return len(rr.psubs)+len(rr.qsubs) == 0
+	return !interest
 }
 
 // This is when the underlying stream has been purged.
@@ -5368,14 +5372,14 @@ func (o *consumer) switchToEphemeral() {
 	o.mu.Lock()
 	o.cfg.Durable = _EMPTY_
 	store, ok := o.store.(*consumerFileStore)
-	rr := o.acc.sl.Match(o.cfg.DeliverSubject)
+	interest := o.acc.sl.HasInterest(o.cfg.DeliverSubject)
 	// Setup dthresh.
 	o.updateInactiveThreshold(&o.cfg)
 	o.updatePauseState(&o.cfg)
 	o.mu.Unlock()
 
 	// Update interest
-	o.updateDeliveryInterest(len(rr.psubs)+len(rr.qsubs) > 0)
+	o.updateDeliveryInterest(interest)
 	// Write out new config
 	if ok {
 		store.updateConfig(o.cfg)
