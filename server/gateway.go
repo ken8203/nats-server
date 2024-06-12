@@ -2150,7 +2150,7 @@ func (c *client) gatewayInterest(acc, subj string) (bool, *SublistResult, func()
 	// only interest-only mode.
 	psi := !accountInMap && !c.gw.interestOnlyMode
 	var r *SublistResult
-	var rc func()
+	rc := func() {}
 	if accountInMap {
 		// If in map, check for subs interest with sublist.
 		e := ei.(*outsie)
